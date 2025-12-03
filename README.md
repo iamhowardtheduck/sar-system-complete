@@ -65,10 +65,10 @@ The system automatically maps Elasticsearch data to these official SAR template 
 4. **Set up Elasticsearch index:**
    ```bash
    # Create index with proper mapping
-   curl -X PUT "your-elasticsearch:9200/sar-reports" \
+   curl -X PUT "http://kubernetes-vm:30920/sar-reports" \
      -H "Content-Type: application/json" \
      -d @elasticsearch-mapping.json \
-     -u "username:password"
+     -u "fraud:hunter"
    ```
 
 5. **Load sample data (optional):**
