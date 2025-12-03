@@ -35,7 +35,10 @@
     "express": "^4.18.2",
     "express-rate-limit": "^7.1.5",
     "helmet": "^7.1.0",
-    "morgan": "^1.10.0"
+    "morgan": "^1.10.0",
+    "pdf-lib": "^1.17.1",
+    "fs": "^0.0.1-security",
+    "xmlbuilder2": "^3.1.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.2",
@@ -47,14 +50,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/iamhowardtheduck/sar-management-system.git"
+    "url": "git+https://github.com/yourusername/sar-management-system.git"
   },
   "bugs": {
-    "url": "https://github.com/iamhowardtheduck/sar-management-system/issues"
+    "url": "https://github.com/yourusername/sar-management-system/issues"
   },
-  "homepage": "https://github.com/iamhowardtheduck/sar-management-system#readme",
+  "homepage": "https://github.com/yourusername/sar-management-system#readme",
   "funding": {
     "type": "individual",
-    "url": "https://github.com/sponsors/iamhowardtheduck"
+    "url": "https://github.com/sponsors/yourusername"
   }
 }
