@@ -136,10 +136,12 @@ app.set('views', path.join(__dirname, 'views'));
 
 // Routes
 app.get('/', (req, res) => {
-  res.render('index');
+  res.render('index', { 
+    title: 'SAR Management System'
+  });
 });
 
-// API endpoint to get SAR data from Elasticsearch
+// API endpoint to get SAR data from Elasticsearch with enhanced fuzzy search
 app.get('/api/sar-reports', async (req, res) => {
   try {
     const { page = 1, size = 10, search } = req.query;
@@ -148,16 +150,93 @@ app.get('/api/sar-reports', async (req, res) => {
     let query = { match_all: {} };
     
     if (search) {
+      // Enhanced fuzzy search with multiple strategies
       query = {
-        multi_match: {
-          query: search,
-          fields: [
-            'financial_institution_name',
-            'suspect_name',
-            'suspect_entity_name',
-            'account_number',
-            'address'
-          ]
+        bool: {
+          should: [
+            // Fuzzy search on financial institution name
+            {
+              fuzzy: {
+                financial_institution_name: {
+                  value: search,
+                  fuzziness: "AUTO",
+                  prefix_length: 1,
+                  max_expansions: 50
+                }
+              }
+            },
+            // Fuzzy search on suspect last name
+            {
+              fuzzy: {
+                suspect_last_name: {
+                  value: search,
+                  fuzziness: "AUTO",
+                  prefix_length: 1,
+                  max_expansions: 50
+                }
+              }
+            },
+            // Fuzzy search on suspect first name
+            {
+              fuzzy: {
+                suspect_first_name: {
+                  value: search,
+                  fuzziness: "AUTO",
+                  prefix_length: 1,
+                  max_expansions: 50
+                }
+              }
+            },
+            // Fuzzy search on entity name (for companies)
+            {
+              fuzzy: {
+                suspect_entity_name: {
+                  value: search,
+                  fuzziness: "AUTO",
+                  prefix_length: 1,
+                  max_expansions: 50
+                }
+              }
+            },
+            // Fuzzy search on activity description
+            {
+              fuzzy: {
+                activity_description: {
+                  value: search,
+                  fuzziness: "AUTO",
+                  prefix_length: 2,
+                  max_expansions: 50
+                }
+              }
+            },
+            // Fuzzy search on account number
+            {
+              fuzzy: {
+                account_number: {
+                  value: search,
+                  fuzziness: "AUTO",
+                  prefix_length: 1,
+                  max_expansions: 50
+                }
+              }
+            },
+            // Regular match for exact matches (higher score)
+            {
+              multi_match: {
+                query: search,
+                fields: [
+                  'financial_institution_name^2',
+                  'suspect_last_name^2', 
+                  'suspect_first_name^2',
+                  'suspect_entity_name^2',
+                  'activity_description',
+                  'account_number'
+                ],
+                boost: 2
+              }
+            }
+          ],
+          minimum_should_match: 1
         }
       };
     }
@@ -306,9 +385,15 @@ app.get('/api/sar-reports/:id/fincen8300', async (req, res) => {
     // Generate the FinCEN 8300 XML
     const xmlContent = generateFinCEN8300XML(source, reportId);
     
-    // Set response headers for XML download
+    // Create filename and file path
     const filename = `FinCEN-8300-${reportId}-${new Date().toISOString().split('T')[0]}.xml`;
+    const filePath = path.join(__dirname, filename);
     
+    // Save XML to server directory
+    fs.writeFileSync(filePath, xmlContent, 'utf8');
+    console.log(`✅ XML saved to: ${filePath}`);
+    
+    // Also send to browser for download
     res.setHeader('Content-Type', 'application/xml');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Content-Length', Buffer.byteLength(xmlContent, 'utf8'));
@@ -328,14 +413,67 @@ app.get('/api/sar-reports/:id/fincen8300', async (req, res) => {
   }
 });
 
+// API endpoint to list generated files in the server directory
+app.get('/api/generated-files', (req, res) => {
+  try {
+    const files = fs.readdirSync(__dirname)
+      .filter(file => file.match(/^(SAR-Report-|FinCEN-8300-).*(\.pdf|\.xml)$/))
+      .map(filename => {
+        const filePath = path.join(__dirname, filename);
+        const stats = fs.statSync(filePath);
+        return {
+          filename,
+          path: filePath,
+          size: stats.size,
+          created: stats.birthtime,
+          modified: stats.mtime,
+          type: filename.endsWith('.pdf') ? 'PDF' : 'XML'
+        };
+      })
+      .sort((a, b) => b.modified - a.modified); // Sort by most recent first
+
+    res.json({
+      files,
+      count: files.length,
+      directory: __dirname
+    });
+
+  } catch (error) {
+    console.error('Error listing generated files:', error);
+    res.status(500).json({ 
+      error: 'Failed to list generated files',
+      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
 // Function to generate FinCEN Form 8300 XML
 function generateFinCEN8300XML(reportData, reportId) {
   try {
-    // Generate unique sequence numbers for XML elements
+    // Text cleaning function to prevent XML issues
+    const cleanXMLText = (text, maxLength = null) => {
+      if (!text) return '';
+      
+      let cleanText = String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;')
+        .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+      
+      if (maxLength && cleanText.length > maxLength) {
+        cleanText = cleanText.substring(0, maxLength);
+      }
+      
+      return cleanText;
+    };
+
+    // Sequential number generator for XML elements
     let seqNum = 1;
     const getSeqNum = () => seqNum++;
     
-    // Format date for FinCEN (YYYYMMDD format)
+    // Date formatting for FinCEN
     const formatFinCENDate = (dateString) => {
       if (!dateString) return '';
       try {
@@ -349,167 +487,89 @@ function generateFinCEN8300XML(reportData, reportId) {
       }
     };
 
-    // Clean text for XML (remove invalid characters)
-    const cleanXMLText = (text, maxLength = 150) => {
-      if (!text) return '';
-      return String(text)
-        .replace(/[<>&"']/g, (char) => {
-          const entities = { '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' };
-          return entities[char];
-        })
-        .replace(/[^\x20-\x7E]/g, '') // Remove non-printable characters
-        .trim()
-        .substring(0, maxLength);
-    };
-
-    // Calculate total amount (ensure it's over $10,000 threshold for Form 8300)
-    const totalAmount = reportData.total_dollar_amount || 10001;
-    const transactionDate = formatFinCENDate(reportData.suspicious_activity_date || new Date().toISOString());
-    const filingDate = formatFinCENDate(new Date().toISOString());
-
-    // Create XML document following FinCEN 8300X schema
+    // Create XML document
     const doc = create({ version: '1.0', encoding: 'UTF-8' })
-      .ele('EFilingBatchXML', { 
+      .ele('EFilingBatchXML', {
         'xmlns': 'www.fincen.gov/base',
         'xmlns:xsi': 'http://www.w3.org/2001/XMLSchema-instance',
-        'xsi:schemaLocation': 'www.fincen.gov/base https://www.fincen.gov/system/files/schema/base/EFL_8300XBatchSchema.xsd',
-        'TotalAmount': totalAmount,
-        'PartyCount': 4, // Minimum required parties
-        'ActivityCount': 1
+        'xsi:schemaLocation': 'www.fincen.gov/base https://www.fincen.gov/base'
       })
-        .ele('FormTypeCode').txt('8300X').up()
-        .ele('Activity', { 'SeqNum': getSeqNum() })
-          // Activity details
-          .ele('FilingDateText').txt(filingDate).up()
-          .ele('SuspiciousTransactionIndicator').txt('Y').up() // Since this is from SAR data
-          
-          // Activity Association
-          .ele('ActivityAssociation', { 'SeqNum': getSeqNum() })
-            .ele('InitialReportIndicator').txt('Y').up()
+      .ele('Activity', { 'SeqNum': getSeqNum() })
+        .ele('ActivityAssociation', { 'SeqNum': getSeqNum() })
+          .ele('CorrectsAmendsPriorReportIndicator').txt('N').up()
+          .ele('FinCENDirectBackFileIndicator').txt('N').up()
+        .up()
+        
+        .ele('Party', { 'SeqNum': getSeqNum() })
+          .ele('ActivityPartyTypeCode').txt('35').up() // Filing institution
+          .ele('PrimaryRegulatorTypeCode').txt('9').up() // Other
+          .ele('PartyName', { 'SeqNum': getSeqNum() })
+            .ele('PartyNameTypeCode').txt('L').up() // Legal name
+            .ele('RawPartyFullName').txt(cleanXMLText(reportData.financial_institution_name || 'Unknown Institution', 150)).up()
+          .up()
+          .ele('Address', { 'SeqNum': getSeqNum() })
+            .ele('RawCityText').txt(cleanXMLText(reportData.financial_institution_city || '', 50)).up()
+            .ele('RawCountryCodeText').txt('US').up()
+            .ele('RawStateCodeText').txt(cleanXMLText(reportData.financial_institution_state || '', 3)).up()
+            .ele('RawStreetAddress1Text').txt(cleanXMLText(reportData.financial_institution_address || '', 100)).up()
+            .ele('RawZIPCode').txt(cleanXMLText(reportData.financial_institution_zip || '', 10)).up()
+          .up()
+          .ele('PartyIdentification', { 'SeqNum': getSeqNum() })
+            .ele('PartyIdentificationNumberText').txt(cleanXMLText(reportData.financial_institution_ein || '', 25)).up()
+            .ele('PartyIdentificationTypeCode').txt('2').up() // EIN
+          .up()
+        .up()
+        
+        .ele('Party', { 'SeqNum': getSeqNum() })
+          .ele('ActivityPartyTypeCode').txt('23').up() // Person conducting transaction
+          .ele('IndividualBirthDateText').txt(formatFinCENDate(reportData.suspect_date_of_birth)).up()
+          .ele('PartyName', { 'SeqNum': getSeqNum() })
+            .ele('PartyNameTypeCode').txt('L').up()
+            .ele('RawEntityIndividualLastName').txt(cleanXMLText(reportData.suspect_last_name || reportData.suspect_entity_name || '', 150)).up()
+            .ele('RawIndividualFirstName').txt(cleanXMLText(reportData.suspect_first_name || '', 35)).up()
+          .up()
+          .ele('Address', { 'SeqNum': getSeqNum() })
+            .ele('RawCityText').txt(cleanXMLText(reportData.suspect_city || '', 50)).up()
+            .ele('RawCountryCodeText').txt(cleanXMLText(reportData.suspect_country || 'US', 2)).up()
+            .ele('RawStateCodeText').txt(cleanXMLText(reportData.suspect_state || '', 3)).up()
+            .ele('RawStreetAddress1Text').txt(cleanXMLText(reportData.suspect_address || '', 100)).up()
+            .ele('RawZIPCode').txt(cleanXMLText(reportData.suspect_zip || '', 10)).up()
+          .up()
+          .ele('PhoneNumber', { 'SeqNum': getSeqNum() })
+            .ele('PhoneNumberText').txt(cleanXMLText(reportData.suspect_phone || '', 16)).up()
+          .up()
+          .ele('PartyIdentification', { 'SeqNum': getSeqNum() })
+            .ele('PartyIdentificationNumberText').txt(cleanXMLText(reportData.suspect_ssn_tin || '', 25)).up()
+            .ele('PartyIdentificationTypeCode').txt('1').up() // SSN
+          .up()
+          .ele('PartyOccupationBusiness', { 'SeqNum': getSeqNum() })
+            .ele('OccupationBusinessText').txt(cleanXMLText(reportData.suspect_occupation || '', 50)).up()
+          .up()
+        .up()
+        
+        .ele('CurrencyTransactionActivity', { 'SeqNum': getSeqNum() })
+          .ele('CurrencyTransactionActivityDetail', { 'SeqNum': getSeqNum() })
+            .ele('CurrencyTransactionActivityDetailTypeCode').txt('1').up()
+            .ele('DetailTransactionAmountText').txt(String(reportData.total_dollar_amount || 0)).up()
+            .ele('DetailTransactionDescription').txt(cleanXMLText(reportData.activity_description || 'Suspicious cash transaction')).up()
+            .ele('InstrumentProductServiceTypeCode').txt('35').up()
           .up()
           
-          // Party 1: Business that received cash (from financial institution data)
-          .ele('Party', { 'SeqNum': getSeqNum() })
-            .ele('ActivityPartyTypeCode').txt('4').up() // Business that received cash
-            .ele('PartyTypeCode').txt('O').up() // Organization
-            .ele('PartyName', { 'SeqNum': getSeqNum() })
-              .ele('PartyNameTypeCode').txt('L').up() // Legal name
-              .ele('RawPartyFullName').txt(cleanXMLText(reportData.financial_institution_name || 'Financial Institution')).up()
-            .up()
-            .ele('Address', { 'SeqNum': getSeqNum() })
-              .ele('RawStreetAddress1Text').txt(cleanXMLText(reportData.financial_institution_address || '', 100)).up()
-              .ele('RawCityText').txt(cleanXMLText(reportData.financial_institution_city || '', 50)).up()
-              .ele('RawStateCodeText').txt(cleanXMLText(reportData.financial_institution_state || '', 3)).up()
-              .ele('RawZIPCode').txt(cleanXMLText(reportData.financial_institution_zip || '', 9)).up()
-              .ele('RawCountryCodeText').txt('US').up()
-            .up()
-            .ele('PartyIdentification', { 'SeqNum': getSeqNum() })
-              .ele('PartyIdentificationTypeCode').txt('2').up() // EIN
-              .ele('PartyIdentificationNumberText').txt(cleanXMLText(reportData.financial_institution_ein || '', 25)).up()
-            .up()
-          .up()
-          
-          // Party 2: Individual from whom cash was received (suspect information)
-          .ele('Party', { 'SeqNum': getSeqNum() })
-            .ele('ActivityPartyTypeCode').txt('16').up() // Individual from whom cash was received
-            .ele('PartyTypeCode').txt('I').up() // Individual
-            .ele('PartyName', { 'SeqNum': getSeqNum() })
-              .ele('PartyNameTypeCode').txt('L').up() // Legal name
-              .ele('RawEntityIndividualLastName').txt(cleanXMLText(reportData.suspect_last_name || reportData.suspect_entity_name || 'Unknown')).up()
-              .ele('RawIndividualFirstName').txt(cleanXMLText(reportData.suspect_first_name || '', 35)).up()
-            .up()
-            .ele('Address', { 'SeqNum': getSeqNum() })
-              .ele('RawStreetAddress1Text').txt(cleanXMLText(reportData.suspect_address || '', 100)).up()
-              .ele('RawCityText').txt(cleanXMLText(reportData.suspect_city || '', 50)).up()
-              .ele('RawStateCodeText').txt(cleanXMLText(reportData.suspect_state || '', 3)).up()
-              .ele('RawZIPCode').txt(cleanXMLText(reportData.suspect_zip || '', 9)).up()
-              .ele('RawCountryCodeText').txt('US').up()
-            .up()
-            .ele('PhoneNumber', { 'SeqNum': getSeqNum() })
-              .ele('PhoneNumberText').txt(cleanXMLText(reportData.suspect_phone || '', 16)).up()
-            .up()
-            .ele('PartyIdentification', { 'SeqNum': getSeqNum() })
-              .ele('PartyIdentificationTypeCode').txt('1').up() // SSN/ITIN (default assumption)
-              .ele('PartyIdentificationNumberText').txt('').up() // Empty for privacy
-            .up()
-          .up()
-          
-          // Party 3: Transmitter (filing entity)
-          .ele('Party', { 'SeqNum': getSeqNum() })
-            .ele('ActivityPartyTypeCode').txt('35').up() // Transmitter
-            .ele('PartyTypeCode').txt('O').up() // Organization
-            .ele('PartyName', { 'SeqNum': getSeqNum() })
-              .ele('PartyNameTypeCode').txt('L').up() // Legal name
-              .ele('RawPartyFullName').txt(cleanXMLText(reportData.financial_institution_name || 'SAR Filing Institution')).up()
-            .up()
-            .ele('Address', { 'SeqNum': getSeqNum() })
-              .ele('RawStreetAddress1Text').txt(cleanXMLText(reportData.financial_institution_address || '', 100)).up()
-              .ele('RawCityText').txt(cleanXMLText(reportData.financial_institution_city || '', 50)).up()
-              .ele('RawStateCodeText').txt(cleanXMLText(reportData.financial_institution_state || '', 3)).up()
-              .ele('RawZIPCode').txt(cleanXMLText(reportData.financial_institution_zip || '', 9)).up()
-              .ele('RawCountryCodeText').txt('US').up()
-            .up()
-            .ele('PartyIdentification', { 'SeqNum': getSeqNum() })
-              .ele('PartyIdentificationTypeCode').txt('2').up() // EIN
-              .ele('PartyIdentificationNumberText').txt(cleanXMLText(reportData.financial_institution_ein || '', 25)).up()
-            .up()
-          .up()
-          
-          // Party 4: Authorized Official / Contact
-          .ele('Party', { 'SeqNum': getSeqNum() })
-            .ele('ActivityPartyTypeCode').txt('8').up() // Contact for assistance
-            .ele('PartyTypeCode').txt('I').up() // Individual
-            .ele('PartyName', { 'SeqNum': getSeqNum() })
-              .ele('PartyNameTypeCode').txt('L').up() // Legal name
-              .ele('RawEntityIndividualLastName').txt('Compliance').up()
-              .ele('RawIndividualFirstName').txt('Officer').up()
-            .up()
-            .ele('Address', { 'SeqNum': getSeqNum() })
-              .ele('RawStreetAddress1Text').txt(cleanXMLText(reportData.financial_institution_address || '', 100)).up()
-              .ele('RawCityText').txt(cleanXMLText(reportData.financial_institution_city || '', 50)).up()
-              .ele('RawStateCodeText').txt(cleanXMLText(reportData.financial_institution_state || '', 3)).up()
-              .ele('RawZIPCode').txt(cleanXMLText(reportData.financial_institution_zip || '', 9)).up()
-              .ele('RawCountryCodeText').txt('US').up()
-            .up()
-            .ele('PhoneNumber', { 'SeqNum': getSeqNum() })
-              .ele('PhoneNumberText').txt('555-555-0100').up() // Default contact number
-            .up()
-            .ele('PartyOccupationBusiness', { 'SeqNum': getSeqNum() })
-              .ele('OccupationBusinessText').txt('Compliance Officer').up()
-            .up()
-          .up()
-          
-          // Currency Transaction Activity
           .ele('CurrencyTransactionActivity', { 'SeqNum': getSeqNum() })
-            .ele('TotalCashInReceiveAmountText').txt(totalAmount.toString()).up()
-            .ele('TransactionDateText').txt(transactionDate).up()
-            
-            // Activity Detail 1: Cash received
-            .ele('CurrencyTransactionActivityDetail', { 'SeqNum': getSeqNum() })
-              .ele('CurrencyTransactionActivityDetailTypeCode').txt('7').up() // Exchange of cash
-              .ele('DetailTransactionAmountText').txt(totalAmount.toString()).up()
-              .ele('DetailTransactionDescription').txt(cleanXMLText(reportData.activity_description || 'Suspicious cash transaction')).up()
-              .ele('InstrumentProductServiceTypeCode').txt(35).up() // U.S. Currency
-            .up()
-            
-            // Activity Detail 2: Additional detail (required minimum 2)
-            .ele('CurrencyTransactionActivityDetail', { 'SeqNum': getSeqNum() })
-              .ele('CurrencyTransactionActivityDetailTypeCode').txt('999').up() // Other
-              .ele('DetailTransactionAmountText').txt('0').up()
-              .ele('DetailTransactionDescription').txt('Related to suspicious activity report').up()
-              .ele('InstrumentProductServiceTypeCode').txt(35).up() // U.S. Currency
-            .up()
+            .ele('CurrencyTransactionActivityDetailTypeCode').txt('999').up()
+            .ele('DetailTransactionAmountText').txt('0').up()
+            .ele('DetailTransactionDescription').txt('Related to suspicious activity report').up()
+            .ele('InstrumentProductServiceTypeCode').txt('35').up()
           .up()
-          
-          // Activity Narrative (optional)
-          .ele('ActivityNarrativeInformation', { 'SeqNum': getSeqNum() })
-            .ele('ActivityNarrativeSequenceNumber').txt('1').up()
-            .ele('ActivityNarrativeText').txt(cleanXMLText(
-              `This Form 8300 filing is based on suspicious activity identified in SAR report ${reportId}. ` +
-              `Transaction details: ${reportData.activity_description || 'Cash transaction above reporting threshold'}. ` +
-              `Additional investigation may be warranted.`, 750
-            )).up()
-          .up()
+        .up()
+        
+        .ele('ActivityNarrativeInformation', { 'SeqNum': getSeqNum() })
+          .ele('ActivityNarrativeSequenceNumber').txt('1').up()
+          .ele('ActivityNarrativeText').txt(cleanXMLText(
+            `This Form 8300 filing is based on suspicious activity identified in SAR report ${reportId}. ` +
+            `Transaction details: ${reportData.activity_description || 'Cash transaction above reporting threshold'}. ` +
+            `Additional investigation may be warranted.`, 750
+          )).up()
         .up()
       .up();
 
@@ -545,9 +605,15 @@ app.get('/api/sar-reports/:id/pdf', async (req, res) => {
     // Generate the filled PDF
     const pdfBytes = await generateFilledSARPdf(source);
     
-    // Set response headers for PDF download
+    // Create filename and file path
     const filename = `SAR-Report-${reportId}-${new Date().toISOString().split('T')[0]}.pdf`;
+    const filePath = path.join(__dirname, filename);
     
+    // Save PDF to server directory
+    fs.writeFileSync(filePath, pdfBytes);
+    console.log(`✅ PDF saved to: ${filePath}`);
+    
+    // Also send to browser for download
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Content-Length', pdfBytes.length);
@@ -570,292 +636,106 @@ app.get('/api/sar-reports/:id/pdf', async (req, res) => {
 // Function to generate filled SAR PDF
 async function generateFilledSARPdf(reportData) {
   try {
-    // Read the template PDF
+    // Try to use template if available, otherwise create summary
     const templatePath = path.join(__dirname, 'sar-template.pdf');
-    const existingPdfBytes = fs.readFileSync(templatePath);
     
-    // Load the PDF document (handle encrypted PDFs)
-    const pdfDoc = await PDFDocument.load(existingPdfBytes, { 
-      ignoreEncryption: true,
-      updateMetadata: false 
-    });
-    
-    let form;
-    let hasAccessibleForm = false;
-    
-    try {
-      form = pdfDoc.getForm();
-      const fields = form.getFields();
-      
-      if (fields.length > 0) {
-        console.log(`Found ${fields.length} form fields in PDF`);
-        hasAccessibleForm = true;
+    if (fs.existsSync(templatePath)) {
+      const existingPdfBytes = fs.readFileSync(templatePath);
+      const pdfDoc = await PDFDocument.load(existingPdfBytes, { 
+        ignoreEncryption: true,
+        updateMetadata: false
+      });
+
+      try {
+        // Try to get form and fill fields
+        const form = pdfDoc.getForm();
         
-        // Log actual field names for debugging
-        console.log('Available PDF fields:', fields.slice(0, 10).map(f => f.getName()));
-        
-        // Try to fill fields if we can identify them
-        const success = await tryFillKnownFields(form, reportData);
-        
-        if (success) {
-          console.log('✅ Successfully filled PDF form fields');
+        if (form) {
+          console.log('✓ PDF form found, attempting to fill fields...');
           
-          // Try to flatten the form carefully
-          try {
-            form.flatten();
-          } catch (flattenError) {
-            console.warn('Could not flatten form (PDF may remain editable):', flattenError.message);
-          }
-          
+          // Field mapping with error handling
+          const fieldMappings = [
+            { name: '2_Institution_Name', value: reportData.financial_institution_name },
+            { name: '3_EIN', value: reportData.financial_institution_ein },
+            { name: '4_Address', value: reportData.financial_institution_address },
+            { name: '6_City', value: reportData.financial_institution_city },
+            { name: '7_State', value: reportData.financial_institution_state },
+            { name: '8_ZIP', value: reportData.financial_institution_zip },
+            { name: '9_Phone', value: reportData.financial_institution_phone },
+            { name: '14_Account_Numbers', value: reportData.account_number },
+            { name: '15_Last_Name', value: reportData.suspect_last_name || reportData.suspect_entity_name },
+            { name: '16_First_Name', value: reportData.suspect_first_name },
+            { name: '18_Address', value: reportData.suspect_address },
+            { name: '20_City', value: reportData.suspect_city },
+            { name: '21_State', value: reportData.suspect_state },
+            { name: '22_ZIP', value: reportData.suspect_zip },
+            { name: '24_Phone', value: reportData.suspect_phone },
+            { name: '33_Date', value: formatDateForPDF(reportData.suspicious_activity_date) },
+            { name: '34_Amount', value: formatCurrencyForPDF(reportData.total_dollar_amount) }
+          ];
+
+          fieldMappings.forEach(({ name, value }) => {
+            try {
+              if (value) {
+                const field = form.getField(name);
+                if (field instanceof PDFTextField) {
+                  field.setText(String(value));
+                }
+              }
+            } catch (fieldError) {
+              console.log(`⚠ Could not fill field "${name}": ${fieldError.message}`);
+            }
+          });
+
           const pdfBytes = await pdfDoc.save();
           return pdfBytes;
         }
+      } catch (formError) {
+        console.log('⚠ Could not process PDF form, creating summary instead');
       }
-    } catch (formError) {
-      console.warn('PDF form not accessible or fillable:', formError.message);
-      hasAccessibleForm = false;
     }
     
-    // If we get here, form filling failed - use fallback method
-    console.log('📝 Using fallback: creating SAR data summary');
-    return await createSARDataSummaryPdf(await PDFDocument.create(), reportData);
-    
-  } catch (error) {
+    // Fallback: Create data summary
     console.error('Error in generateFilledSARPdf:', error);
-    
-    // Final fallback: create data summary without template
-    console.log('🔄 Creating standalone SAR data summary');
     try {
       return await createSARDataSummaryPdf(await PDFDocument.create(), reportData);
     } catch (fallbackError) {
       throw new Error(`Failed to generate PDF: ${fallbackError.message}`);
     }
-  }
-}
-
-// Try to fill known fields with better error handling
-async function tryFillKnownFields(form, reportData) {
-  try {
-    const fields = form.getFields();
-    const fieldNames = fields.map(f => f.getName().toLowerCase());
-    
-    // Helper function to safely fill form fields with character encoding protection
-    const fillFieldSafely = (fieldName, value) => {
-      try {
-        if (!value) return false;
-        
-        // Clean value to avoid encoding issues
-        const cleanValue = cleanTextForPDF(String(value));
-        
-        // Try to find field by exact name or partial match
-        let field = null;
-        
-        try {
-          field = form.getTextField(fieldName);
-        } catch {
-          // Try to find field by partial name match
-          const matchingFieldName = fieldNames.find(name => 
-            name.includes(fieldName.toLowerCase()) || 
-            fieldName.toLowerCase().includes(name)
-          );
-          
-          if (matchingFieldName) {
-            const actualField = fields.find(f => f.getName().toLowerCase() === matchingFieldName);
-            if (actualField && actualField.constructor.name === 'PDFTextField') {
-              field = actualField;
-            }
-          }
-        }
-        
-        if (field && cleanValue) {
-          field.setText(cleanValue);
-          return true;
-        }
-        
-        return false;
-      } catch (error) {
-        console.warn(`Could not fill field ${fieldName}:`, error.message);
-        return false;
-      }
-    };
-
-    // Common field name patterns to try
-    const fieldMappings = [
-      // Institution information
-      { patterns: ['name', 'institution', 'bank'], value: reportData.financial_institution_name, desc: 'Institution Name' },
-      { patterns: ['ein', 'tax'], value: reportData.financial_institution_ein, desc: 'EIN' },
-      { patterns: ['address', 'addr'], value: reportData.financial_institution_address, desc: 'Address' },
-      { patterns: ['city'], value: reportData.financial_institution_city, desc: 'City' },
-      { patterns: ['state'], value: reportData.financial_institution_state, desc: 'State' },
-      { patterns: ['zip', 'postal'], value: reportData.financial_institution_zip, desc: 'ZIP' },
-      
-      // Account information
-      { patterns: ['account', 'acct'], value: reportData.account_number, desc: 'Account Number' },
-      
-      // Suspect information
-      { patterns: ['suspect', 'subject', 'last'], value: reportData.suspect_last_name || reportData.suspect_entity_name, desc: 'Suspect Name' },
-      { patterns: ['first'], value: reportData.suspect_first_name, desc: 'First Name' },
-      { patterns: ['phone', 'tel'], value: reportData.suspect_phone, desc: 'Phone' },
-      
-      // Activity information
-      { patterns: ['amount', 'dollar', 'money'], value: formatCurrencyForPDF(reportData.total_dollar_amount), desc: 'Dollar Amount' },
-      { patterns: ['date', 'activity'], value: formatDateForPDF(reportData.suspicious_activity_date), desc: 'Activity Date' },
-      { patterns: ['description', 'narrative'], value: reportData.activity_description, desc: 'Description' },
-    ];
-    
-    let filledCount = 0;
-    
-    // Try to fill fields using pattern matching
-    for (const mapping of fieldMappings) {
-      if (!mapping.value) continue;
-      
-      for (const pattern of mapping.patterns) {
-        const matchingFields = fields.filter(field => {
-          const name = field.getName().toLowerCase();
-          return name.includes(pattern) && field.constructor.name === 'PDFTextField';
-        });
-        
-        for (const field of matchingFields) {
-          if (fillFieldSafely(field.getName(), mapping.value)) {
-            console.log(`✅ Filled ${mapping.desc}: ${field.getName()}`);
-            filledCount++;
-            break; // Move to next mapping after successful fill
-          }
-        }
-        
-        if (filledCount > 0 && matchingFields.length > 0) break;
-      }
-    }
-    
-    console.log(`📊 Successfully filled ${filledCount} form fields`);
-    return filledCount > 0;
-    
   } catch (error) {
-    console.error('Error trying to fill form fields:', error);
-    return false;
+    console.log('📝 Creating SAR data summary PDF');
+    return await createSARDataSummaryPdf(await PDFDocument.create(), reportData);
   }
 }
 
-// Clean text to avoid character encoding issues
-function cleanTextForPDF(text) {
-  if (!text) return '';
-  
-  return String(text)
-    // Replace problematic Unicode characters
-    .replace(/[^\x00-\x7F]/g, '') // Remove non-ASCII characters
-    // Replace smart quotes
-    .replace(/[\u2018\u2019]/g, "'")
-    .replace(/[\u201C\u201D]/g, '"')
-    // Replace en/em dashes
-    .replace(/[\u2013\u2014]/g, '-')
-    // Replace other common problematic characters
-    .replace(/\u2026/g, '...') // ellipsis
-    .replace(/\u00A0/g, ' ')   // non-breaking space
-    // Trim and limit length
-    .trim()
-    .substring(0, 500); // Limit field length
-}
-
-// Alternative PDF generation with text overlay (for PDFs without editable forms)
-async function generateSARPdfWithTextOverlay(reportData, basePdf) {
+// Function to create PDF with form overlay (when template exists but form filling fails)
+async function createPdfWithTextOverlay(pdfDoc, reportData) {
   try {
-    console.log('Creating SAR PDF with text overlay');
-    
-    // Create a new PDF document with the data summary
-    const pdfDoc = await PDFDocument.create();
-    
-    // Try to copy pages from template if possible
-    try {
-      const templatePages = await pdfDoc.copyPages(basePdf, basePdf.getPageIndices());
-      templatePages.forEach((page) => pdfDoc.addPage(page));
-      console.log('✅ Template pages copied successfully');
-    } catch (error) {
-      console.log('⚠️  Could not copy template pages, creating data summary instead');
-      // Create a new page with SAR data summary
-      const page = pdfDoc.addPage();
-      return await createSARDataSummaryPdf(pdfDoc, reportData);
-    }
-    
-    // If we got here, we have the template but can't fill forms
-    // Add a data summary page at the end
-    const dataPage = pdfDoc.addPage();
-    const { width, height } = dataPage.getSize();
+    const pages = pdfDoc.getPages();
+    const firstPage = pages[0];
+    const { width, height } = firstPage.getSize();
     const font = await pdfDoc.embedFont('Helvetica');
-    const boldFont = await pdfDoc.embedFont('Helvetica-Bold');
     
-    let yPosition = height - 50;
-    const lineHeight = 20;
-    const leftMargin = 50;
-    
-    // Title
-    dataPage.drawText('SAR DATA SUMMARY', {
-      x: leftMargin,
-      y: yPosition,
-      size: 16,
-      font: boldFont,
-    });
-    yPosition -= 40;
-    
-    // Add data fields
-    const addDataField = (label, value) => {
-      if (value && yPosition > 50) {
-        dataPage.drawText(`${label}: ${value}`, {
-          x: leftMargin,
-          y: yPosition,
-          size: 10,
+    // Add text overlays at approximate field positions
+    // These coordinates would need to be adjusted based on your actual SAR template
+    const overlays = [
+      { x: 150, y: height - 120, text: reportData.financial_institution_name, size: 10 },
+      { x: 150, y: height - 140, text: reportData.financial_institution_ein, size: 10 },
+      { x: 150, y: height - 160, text: reportData.financial_institution_address, size: 10 },
+      // Add more field positions as needed
+    ];
+
+    overlays.forEach(overlay => {
+      if (overlay.text) {
+        firstPage.drawText(String(overlay.text), {
+          x: overlay.x,
+          y: overlay.y,
+          size: overlay.size,
           font: font,
         });
-        yPosition -= lineHeight;
       }
-    };
-    
-    // Financial Institution Information
-    dataPage.drawText('FINANCIAL INSTITUTION INFORMATION', {
-      x: leftMargin,
-      y: yPosition,
-      size: 12,
-      font: boldFont,
     });
-    yPosition -= 25;
-    
-    addDataField('Institution Name (Field 2)', reportData.financial_institution_name);
-    addDataField('EIN (Field 3)', reportData.financial_institution_ein);
-    addDataField('Address (Field 4)', reportData.financial_institution_address);
-    addDataField('City (Field 6)', reportData.financial_institution_city);
-    addDataField('State (Field 7)', reportData.financial_institution_state);
-    addDataField('ZIP (Field 8)', reportData.financial_institution_zip);
-    
-    yPosition -= 10;
-    dataPage.drawText('SUSPECT INFORMATION', {
-      x: leftMargin,
-      y: yPosition,
-      size: 12,
-      font: boldFont,
-    });
-    yPosition -= 25;
-    
-    addDataField('Last Name/Entity (Field 15)', reportData.suspect_last_name || reportData.suspect_entity_name);
-    addDataField('First Name (Field 16)', reportData.suspect_first_name);
-    addDataField('Address (Field 18)', reportData.suspect_address);
-    addDataField('City (Field 20)', reportData.suspect_city);
-    addDataField('State (Field 21)', reportData.suspect_state);
-    addDataField('ZIP (Field 22)', reportData.suspect_zip);
-    addDataField('Phone (Field 24)', reportData.suspect_phone);
-    
-    yPosition -= 10;
-    dataPage.drawText('ACTIVITY INFORMATION', {
-      x: leftMargin,
-      y: yPosition,
-      size: 12,
-      font: boldFont,
-    });
-    yPosition -= 25;
-    
-    addDataField('Activity Date (Field 33)', formatDateForPDF(reportData.suspicious_activity_date));
-    addDataField('Total Amount (Field 34)', formatCurrencyForPDF(reportData.total_dollar_amount));
-    addDataField('Activity Type', reportData.activity_type);
-    addDataField('Description', reportData.activity_description);
-    
+
     const pdfBytes = await pdfDoc.save();
     return pdfBytes;
     
@@ -922,7 +802,7 @@ async function createSARDataSummaryPdf(pdfDoc, reportData) {
       yPosition -= 25;
       
       fields.forEach(([label, value, fieldNum]) => {
-        if (value) {
+        if (value && yPosition > 50) {
           const fieldText = fieldNum ? ` (Field ${fieldNum})` : '';
           page.drawText(`${label}${fieldText}:`, {
             x: leftMargin + 10,
@@ -931,11 +811,10 @@ async function createSARDataSummaryPdf(pdfDoc, reportData) {
             font: boldFont,
           });
           
-          // Wrap long text
-          const maxWidth = rightMargin - leftMargin - 150;
-          const wrappedText = wrapText(String(value), maxWidth, font, 10);
+          // Clean and truncate long text
+          const cleanValue = String(value).substring(0, 60);
           
-          page.drawText(wrappedText, {
+          page.drawText(cleanValue, {
             x: leftMargin + 150,
             y: yPosition,
             size: 10,
@@ -970,12 +849,14 @@ async function createSARDataSummaryPdf(pdfDoc, reportData) {
     // Account Information
     addSection('ACCOUNT INFORMATION', [
       ['Account Number(s)', reportData.account_number, '14'],
+      ['Account Type', reportData.account_type, ''],
     ]);
     
     // Suspect Information
     addSection('PART II - SUSPECT INFORMATION', [
       ['Last Name/Entity Name', reportData.suspect_last_name || reportData.suspect_entity_name, '15'],
       ['First Name', reportData.suspect_first_name, '16'],
+      ['Date of Birth', formatDateForPDF(reportData.suspect_date_of_birth), ''],
       ['Address', reportData.suspect_address, '18'],
       ['City', reportData.suspect_city, '20'],
       ['State', reportData.suspect_state, '21'],
@@ -1113,9 +994,19 @@ app.use((req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`SAR Web System running on port ${PORT}`);
-  console.log(`Access the application at: http://localhost:${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log('🚀 === SAR Management System Started ===');
+  console.log(`🌐 Server running at: http://localhost:${PORT}`);
+  console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+  console.log('');
+  console.log('✨ Features Available:');
+  console.log('  📄 SAR PDF Generation (saved locally + download)');
+  console.log('  📋 FinCEN 8300 XML Generation (saved locally + download)');
+  console.log('  🔍 Enhanced Fuzzy Search');
+  console.log('  📁 Generated Files API (/api/generated-files)');
+  console.log('  📊 Elasticsearch Integration');
+  console.log('');
+  console.log('📁 Files saved to:', __dirname);
+  console.log('🎯 Ready for BSA compliance workflows!');
 });
 
 module.exports = app;
